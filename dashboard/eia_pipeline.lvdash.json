@@ -1,0 +1,744 @@
+{
+  "datasets": [
+    {
+      "name": "runs",
+      "displayName": "runs",
+      "queryLines": [
+        "SELECT started_at, '1. Fetched (re-pulled window)' AS metric,\n",
+        "               coalesce(region_fetched, 0) + coalesce(fuel_fetched, 0) AS row_count\n",
+        "        FROM workspace.eia.ingest_runs\n",
+        "        UNION ALL\n",
+        "        SELECT started_at, '2. Inserted (new hours)',\n",
+        "               coalesce(region_inserted, 0) + coalesce(fuel_inserted, 0)\n",
+        "        FROM workspace.eia.ingest_runs\n",
+        "        UNION ALL\n",
+        "        SELECT started_at, '3. Updated (EIA revisions)',\n",
+        "               coalesce(region_updated, 0) + coalesce(fuel_updated, 0)\n",
+        "        FROM workspace.eia.ingest_runs\n"
+      ]
+    },
+    {
+      "name": "health",
+      "displayName": "health",
+      "queryLines": [
+        "SELECT timestampdiff(MINUTE, max(started_at) FILTER (WHERE status = 'ok'), current_timestamp())\n",
+        "                                                                       AS minutes_since_last_ok_run,\n",
+        "               count_if(status = 'ok' AND started_at >= current_timestamp() - INTERVAL 24 HOURS)\n",
+        "                                                                       AS ok_runs_last_24h,\n",
+        "               count_if(status <> 'ok')                                AS failed_runs,\n",
+        "               (SELECT count(*) FROM workspace.eia.region_data) + (SELECT count(*) FROM workspace.eia.fuel_type_data)\n",
+        "                                                                       AS total_rows\n",
+        "        FROM workspace.eia.ingest_runs\n"
+      ]
+    },
+    {
+      "name": "freshness",
+      "displayName": "freshness",
+      "queryLines": [
+        "SELECT series,\n",
+        "               round(timestampdiff(MINUTE, latest_hour, current_timestamp()) / 60.0, 1) AS hours_behind\n",
+        "        FROM (\n",
+        "          SELECT '1. Demand (D)'           AS series, max(period) AS latest_hour FROM workspace.eia.region_data WHERE type = 'D'\n",
+        "          UNION ALL\n",
+        "          SELECT '2. Net generation (NG)',            max(period)                FROM workspace.eia.region_data WHERE type = 'NG'\n",
+        "          UNION ALL\n",
+        "          SELECT '3. Generation by fuel',             max(period)                FROM workspace.eia.fuel_type_data\n",
+        "        )\n"
+      ]
+    },
+    {
+      "name": "us_demand",
+      "displayName": "us_demand",
+      "queryLines": [
+        "WITH recent AS (\n",
+        "          SELECT period, value FROM workspace.eia.region_data\n",
+        "          WHERE respondent = 'US48' AND type = 'D' AND period >= current_timestamp() - INTERVAL 7 DAYS\n",
+        "            -- newest hour is partial (not every operator has reported yet), so it always dips: drop it\n",
+        "            AND period < (SELECT max(period) FROM workspace.eia.region_data WHERE respondent = 'US48' AND type = 'D')\n",
+        "        ),\n",
+        "        hist AS (\n",
+        "          SELECT dayofyear(period) AS doy, hour(period) AS hr, avg(value) AS avg_mwh\n",
+        "          FROM workspace.eia.region_data\n",
+        "          WHERE respondent = 'US48' AND type = 'D' AND year(period) BETWEEN 2019 AND 2025\n",
+        "          GROUP BY 1, 2\n",
+        "        )\n",
+        "        SELECT period, 'Last 7 days' AS series, value AS mwh FROM recent\n",
+        "        UNION ALL\n",
+        "        SELECT r.period, '2019-2025 average (same date & hour)', round(h.avg_mwh)\n",
+        "        FROM recent r JOIN hist h ON h.doy = dayofyear(r.period) AND h.hr = hour(r.period)\n"
+      ]
+    },
+    {
+      "name": "solar_by_year",
+      "displayName": "solar_by_year",
+      "queryLines": [
+        "WITH sun AS (\n",
+        "          SELECT f.period, sum(f.value) AS mwh, count(*) AS n\n",
+        "          FROM workspace.eia.fuel_type_data f JOIN workspace.eia.respondents r USING (respondent)\n",
+        "          WHERE r.respondent_kind = 'balancing_authority' AND f.fueltype = 'SUN'\n",
+        "          GROUP BY f.period\n",
+        "        ),\n",
+        "        complete AS (\n",
+        "          SELECT * FROM sun\n",
+        "          WHERE n >= 0.9 * (SELECT max(n) FROM sun WHERE period >= current_timestamp() - INTERVAL 30 DAYS)\n",
+        "        ),\n",
+        "        last_full_day AS (SELECT date(max(period)) - INTERVAL 1 DAY AS d FROM complete)\n",
+        "        SELECT cast(year(period) AS STRING) AS year, round(sum(mwh) / 1000) AS solar_gwh\n",
+        "        FROM complete, last_full_day\n",
+        "        WHERE dayofyear(period) BETWEEN dayofyear(d) - 6 AND dayofyear(d)\n",
+        "        GROUP BY 1\n"
+      ]
+    },
+    {
+      "name": "us_mix",
+      "displayName": "us_mix",
+      "queryLines": [
+        "WITH ba AS (\n",
+        "          SELECT f.period, f.respondent, r.respondent_name, CASE f.fueltype WHEN 'COL' THEN 'Coal'  WHEN 'NG' THEN 'Natural gas'  WHEN 'NUC' THEN 'Nuclear'\n",
+        "                       WHEN 'WAT' THEN 'Hydro' WHEN 'SUN' THEN 'Solar' WHEN 'SNB' THEN 'Solar'\n",
+        "                       WHEN 'WND' THEN 'Wind'  WHEN 'WNB' THEN 'Wind'\n",
+        "                       WHEN 'BAT' THEN 'Storage' WHEN 'PS' THEN 'Storage' WHEN 'OES' THEN 'Storage'\n",
+        "                       WHEN 'UES' THEN 'Storage'\n",
+        "                       ELSE 'Other' END AS fuel, f.value\n",
+        "          FROM workspace.eia.fuel_type_data f JOIN workspace.eia.respondents r USING (respondent)\n",
+        "          WHERE r.respondent_kind = 'balancing_authority' AND f.period >= current_timestamp() - INTERVAL 7 DAYS\n",
+        "        ),\n",
+        "        reporting AS (SELECT period, count(DISTINCT respondent) AS n FROM ba GROUP BY period),\n",
+        "        complete  AS (SELECT period FROM reporting WHERE n >= 0.9 * (SELECT max(n) FROM reporting))\n",
+        "        SELECT period, fuel, round(sum(value) / 1000, 1) AS gwh\n",
+        "        FROM ba JOIN complete USING (period)\n",
+        "        GROUP BY 1, 2\n"
+      ]
+    },
+    {
+      "name": "operator_mix",
+      "displayName": "operator_mix",
+      "queryLines": [
+        "SELECT period, concat(coalesce(nullif(respondent_name, ''), respondent), ' (', respondent, ')') AS operator,\n",
+        "               fuel, sum(value) AS mwh\n",
+        "        FROM (\n",
+        "          SELECT f.period, f.respondent, r.respondent_name, CASE f.fueltype WHEN 'COL' THEN 'Coal'  WHEN 'NG' THEN 'Natural gas'  WHEN 'NUC' THEN 'Nuclear'\n",
+        "                       WHEN 'WAT' THEN 'Hydro' WHEN 'SUN' THEN 'Solar' WHEN 'SNB' THEN 'Solar'\n",
+        "                       WHEN 'WND' THEN 'Wind'  WHEN 'WNB' THEN 'Wind'\n",
+        "                       WHEN 'BAT' THEN 'Storage' WHEN 'PS' THEN 'Storage' WHEN 'OES' THEN 'Storage'\n",
+        "                       WHEN 'UES' THEN 'Storage'\n",
+        "                       ELSE 'Other' END AS fuel, f.value\n",
+        "          FROM workspace.eia.fuel_type_data f JOIN workspace.eia.respondents r USING (respondent)\n",
+        "          WHERE r.respondent_kind = 'balancing_authority' AND f.period >= current_timestamp() - INTERVAL 7 DAYS\n",
+        "        )\n",
+        "        GROUP BY 1, 2, 3\n"
+      ]
+    }
+  ],
+  "pages": [
+    {
+      "name": "main",
+      "displayName": "EIA grid pipeline",
+      "layout": [
+        {
+          "widget": {
+            "name": "hdr",
+            "multilineTextboxSpec": {
+              "lines": [
+                "## Is it alive?\n",
+                "\n",
+                "Hourly Databricks job pulls EIA's hourly grid data and MERGEs it into Delta tables. Every run (success or failure) is logged to `ingest_runs`. Times are UTC.\n"
+              ]
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 0,
+            "width": 6,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "c_last",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "health",
+                  "fields": [
+                    {
+                      "name": "minutes_since_last_ok_run",
+                      "expression": "`minutes_since_last_ok_run`"
+                    }
+                  ],
+                  "disaggregated": true
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "counter",
+              "encodings": {
+                "value": {
+                  "fieldName": "minutes_since_last_ok_run",
+                  "displayName": "Minutes since last successful run"
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Minutes since last successful run"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 2,
+            "width": 2,
+            "height": 3
+          }
+        },
+        {
+          "widget": {
+            "name": "c_runs",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "health",
+                  "fields": [
+                    {
+                      "name": "ok_runs_last_24h",
+                      "expression": "`ok_runs_last_24h`"
+                    }
+                  ],
+                  "disaggregated": true
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "counter",
+              "encodings": {
+                "value": {
+                  "fieldName": "ok_runs_last_24h",
+                  "displayName": "Successful runs, last 24h"
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Successful runs, last 24h"
+              }
+            }
+          },
+          "position": {
+            "x": 2,
+            "y": 2,
+            "width": 2,
+            "height": 3
+          }
+        },
+        {
+          "widget": {
+            "name": "c_rows",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "health",
+                  "fields": [
+                    {
+                      "name": "total_rows",
+                      "expression": "`total_rows`"
+                    }
+                  ],
+                  "disaggregated": true
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "counter",
+              "encodings": {
+                "value": {
+                  "fieldName": "total_rows",
+                  "displayName": "Total rows (seed + live)"
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Total rows (seed + live)"
+              }
+            }
+          },
+          "position": {
+            "x": 4,
+            "y": 2,
+            "width": 2,
+            "height": 3
+          }
+        },
+        {
+          "widget": {
+            "name": "w_runs",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "runs",
+                  "fields": [
+                    {
+                      "name": "started_at",
+                      "expression": "`started_at`"
+                    },
+                    {
+                      "name": "row_count",
+                      "expression": "`row_count`"
+                    },
+                    {
+                      "name": "metric",
+                      "expression": "`metric`"
+                    }
+                  ],
+                  "disaggregated": true
+                }
+              }
+            ],
+            "spec": {
+              "version": 3,
+              "widgetType": "line",
+              "encodings": {
+                "x": {
+                  "fieldName": "started_at",
+                  "scale": {
+                    "type": "temporal"
+                  },
+                  "displayName": "Run started (UTC)"
+                },
+                "y": {
+                  "fieldName": "row_count",
+                  "scale": {
+                    "type": "quantitative"
+                  },
+                  "displayName": "Rows"
+                },
+                "color": {
+                  "fieldName": "metric",
+                  "scale": {
+                    "type": "categorical"
+                  },
+                  "displayName": ""
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Every run: rows fetched vs. rows actually written",
+                "showDescription": true,
+                "description": "Each run re-fetches ~36h of data; the MERGE only writes new hours and revisions. A gap in the top line is a missed run."
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 5,
+            "width": 4,
+            "height": 6
+          }
+        },
+        {
+          "widget": {
+            "name": "w_fresh",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "freshness",
+                  "fields": [
+                    {
+                      "name": "series",
+                      "expression": "`series`"
+                    },
+                    {
+                      "name": "hours_behind",
+                      "expression": "`hours_behind`"
+                    }
+                  ],
+                  "disaggregated": true
+                }
+              }
+            ],
+            "spec": {
+              "version": 3,
+              "widgetType": "bar",
+              "encodings": {
+                "x": {
+                  "fieldName": "series",
+                  "scale": {
+                    "type": "categorical"
+                  },
+                  "displayName": "Series"
+                },
+                "y": {
+                  "fieldName": "hours_behind",
+                  "scale": {
+                    "type": "quantitative"
+                  },
+                  "displayName": "Hours behind now"
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "How far behind is each series? (hours)",
+                "showDescription": true,
+                "description": "Generation is posted a day at a time, so it trails demand by 15-30h."
+              }
+            }
+          },
+          "position": {
+            "x": 4,
+            "y": 5,
+            "width": 2,
+            "height": 6
+          }
+        },
+        {
+          "widget": {
+            "name": "hdr2",
+            "multilineTextboxSpec": {
+              "lines": [
+                "## Live vs. history\n",
+                "\n",
+                "Live hourly data (EIA API) joined to the 2019-2025 seed (EIA bulk file).\n"
+              ]
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 11,
+            "width": 6,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "w_demand",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "us_demand",
+                  "fields": [
+                    {
+                      "name": "period",
+                      "expression": "`period`"
+                    },
+                    {
+                      "name": "mwh",
+                      "expression": "`mwh`"
+                    },
+                    {
+                      "name": "series",
+                      "expression": "`series`"
+                    }
+                  ],
+                  "disaggregated": true
+                }
+              }
+            ],
+            "spec": {
+              "version": 3,
+              "widgetType": "line",
+              "encodings": {
+                "x": {
+                  "fieldName": "period",
+                  "scale": {
+                    "type": "temporal"
+                  },
+                  "displayName": "Hour (UTC)"
+                },
+                "y": {
+                  "fieldName": "mwh",
+                  "scale": {
+                    "type": "quantitative"
+                  },
+                  "displayName": "MWh"
+                },
+                "color": {
+                  "fieldName": "series",
+                  "scale": {
+                    "type": "categorical"
+                  },
+                  "displayName": ""
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "US Lower 48 electricity demand vs. history"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 13,
+            "width": 6,
+            "height": 7
+          }
+        },
+        {
+          "widget": {
+            "name": "w_solar",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "solar_by_year",
+                  "fields": [
+                    {
+                      "name": "year",
+                      "expression": "`year`"
+                    },
+                    {
+                      "name": "solar_gwh",
+                      "expression": "`solar_gwh`"
+                    }
+                  ],
+                  "disaggregated": true
+                }
+              }
+            ],
+            "spec": {
+              "version": 3,
+              "widgetType": "bar",
+              "encodings": {
+                "x": {
+                  "fieldName": "year",
+                  "scale": {
+                    "type": "categorical"
+                  },
+                  "displayName": "Year"
+                },
+                "y": {
+                  "fieldName": "solar_gwh",
+                  "scale": {
+                    "type": "quantitative"
+                  },
+                  "displayName": "GWh"
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "US solar generation, same week each year (GWh)",
+                "showDescription": true,
+                "description": "Most recent complete week vs. the same calendar week in past years."
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 20,
+            "width": 2,
+            "height": 7
+          }
+        },
+        {
+          "widget": {
+            "name": "w_us_mix",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "us_mix",
+                  "fields": [
+                    {
+                      "name": "period",
+                      "expression": "`period`"
+                    },
+                    {
+                      "name": "gwh",
+                      "expression": "`gwh`"
+                    },
+                    {
+                      "name": "fuel",
+                      "expression": "`fuel`"
+                    }
+                  ],
+                  "disaggregated": true
+                }
+              }
+            ],
+            "spec": {
+              "version": 3,
+              "widgetType": "area",
+              "encodings": {
+                "x": {
+                  "fieldName": "period",
+                  "scale": {
+                    "type": "temporal"
+                  },
+                  "displayName": "Hour (UTC)"
+                },
+                "y": {
+                  "fieldName": "gwh",
+                  "scale": {
+                    "type": "quantitative"
+                  },
+                  "displayName": "GWh"
+                },
+                "color": {
+                  "fieldName": "fuel",
+                  "scale": {
+                    "type": "categorical"
+                  },
+                  "displayName": "Fuel"
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "US generation by fuel, last 7 days (all operators added up)",
+                "showDescription": true,
+                "description": "Complete hours only; the newest day is still being reported."
+              }
+            }
+          },
+          "position": {
+            "x": 2,
+            "y": 20,
+            "width": 4,
+            "height": 7
+          }
+        },
+        {
+          "widget": {
+            "name": "f_operator",
+            "queries": [
+              {
+                "name": "f_operator_values",
+                "query": {
+                  "datasetName": "operator_mix",
+                  "fields": [
+                    {
+                      "name": "operator",
+                      "expression": "`operator`"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "filter-single-select",
+              "encodings": {
+                "fields": [
+                  {
+                    "fieldName": "operator",
+                    "displayName": "Operator",
+                    "queryName": "f_operator_values"
+                  }
+                ]
+              },
+              "selection": {
+                "defaultSelection": {
+                  "values": {
+                    "dataType": "STRING",
+                    "values": [
+                      {
+                        "value": "PacifiCorp East (PACE)"
+                      }
+                    ]
+                  }
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Operator"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 27,
+            "width": 2,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "hdr3",
+            "multilineTextboxSpec": {
+              "lines": [
+                "**One operator at a time.** Pick any of the 68 balancing authorities;the chart below redraws for it.\n"
+              ]
+            }
+          },
+          "position": {
+            "x": 2,
+            "y": 27,
+            "width": 4,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "w_operator",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "operator_mix",
+                  "fields": [
+                    {
+                      "name": "period",
+                      "expression": "`period`"
+                    },
+                    {
+                      "name": "mwh",
+                      "expression": "`mwh`"
+                    },
+                    {
+                      "name": "fuel",
+                      "expression": "`fuel`"
+                    }
+                  ],
+                  "disaggregated": true
+                }
+              }
+            ],
+            "spec": {
+              "version": 3,
+              "widgetType": "area",
+              "encodings": {
+                "x": {
+                  "fieldName": "period",
+                  "scale": {
+                    "type": "temporal"
+                  },
+                  "displayName": "Hour (UTC)"
+                },
+                "y": {
+                  "fieldName": "mwh",
+                  "scale": {
+                    "type": "quantitative"
+                  },
+                  "displayName": "MWh"
+                },
+                "color": {
+                  "fieldName": "fuel",
+                  "scale": {
+                    "type": "categorical"
+                  },
+                  "displayName": "Fuel"
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Generation by fuel for the selected operator, last 7 days"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 29,
+            "width": 6,
+            "height": 7
+          }
+        }
+      ]
+    }
+  ]
+}

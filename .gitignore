@@ -1,0 +1,15 @@
+# raw + converted data stays local (seeding etiquette: download once, never commit)
+data/
+# local env + secrets
+.venv/
+.env
+*.env
+.databrickscfg
+__pycache__/
+.DS_Store
+
+# demo videos: uploaded to Canvas, too big for git
+*.mov
+*.mp4
+# files prepared for Canvas (transcript, PDFs): not part of the repo
+submission/

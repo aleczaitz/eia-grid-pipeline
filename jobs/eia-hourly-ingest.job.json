@@ -1,0 +1,41 @@
+{
+  "description": "CS 452 data pipeline: fetch EIA hourly grid data (region + fuel type), MERGE into workspace.eia Delta tables, log to ingest_runs.",
+  "email_notifications": {
+    "no_alert_for_skipped_runs": false,
+    "on_failure": [
+      "aleczaitz@gmail.com"
+    ]
+  },
+  "format": "MULTI_TASK",
+  "max_concurrent_runs": 1,
+  "name": "eia-hourly-ingest",
+  "queue": {
+    "enabled": true
+  },
+  "schedule": {
+    "pause_status": "UNPAUSED",
+    "quartz_cron_expression": "0 10 * * * ?",
+    "timezone_id": "UTC"
+  },
+  "tags": {
+    "project": "cs452-pipeline"
+  },
+  "tasks": [
+    {
+      "disabled": false,
+      "email_notifications": {},
+      "notebook_task": {
+        "base_parameters": {
+          "dry_run": "false"
+        },
+        "notebook_path": "/Users/aleczaitz@gmail.com/eia-pipeline/hourly_ingest",
+        "source": "WORKSPACE"
+      },
+      "run_if": "ALL_SUCCESS",
+      "task_key": "ingest",
+      "timeout_seconds": 2700
+    }
+  ],
+  "timeout_seconds": 2700,
+  "webhook_notifications": {}
+}
